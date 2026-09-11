@@ -9,7 +9,9 @@ services:
       HOST: "0.0.0.0"
       PORT: "8080"
       DATA_DIR: "/app/data"
+      PARAMETER_STORE_KEY_FILE: "/run/secrets/parameter-store.key"
     ports:
       - "0.0.0.0:8080:8080"
     volumes:
       - ./data:/app/data
+      - ./parameter-store.key:/run/secrets/parameter-store.key:ro

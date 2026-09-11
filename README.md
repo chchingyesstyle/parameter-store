@@ -1,19 +1,22 @@
 # Parameter Store
 
-A small, self-hosted parameter/value panel for use on a trusted local network.
+A small, self-hosted parameter/value panel for use on a trusted local network,
+with values encrypted at rest in SQLite.
 
-> **Non-secret tool only.** Do not enter or store passwords, API keys, tokens,
-> connection strings, personal data, or any other confidential information.
-> This service uses plain HTTP and has no authentication by design.
+> **Security boundary.** Values are encrypted at rest with a key stored outside
+> the database and Docker image. The service still uses plain HTTP and has no
+> authentication by design, so use it only on a trusted network or place it
+> behind HTTPS and an authentication layer before storing sensitive values.
 
 ## Features
 
 - Browser panel at `/` for listing, searching, saving, editing, copying, and deleting values
 - REST API for parameter/value CRUD operations
-- SQLite persistence on the host
+- SQLite persistence on the host with AES-GCM-encrypted value blobs
+- External, read-only encryption key file mounted into the container
 - Parameter-name validation and value-size limits
 - Safe browser rendering using DOM text nodes rather than injected HTML
-- No third-party Python dependencies
+- Python `cryptography` dependency for authenticated encryption
 - Docker image runs as non-root UID/GID `1000:1000`
 
 ## Requirements
@@ -26,8 +29,20 @@ A small, self-hosted parameter/value panel for use on a trusted local network.
 From the project directory:
 
 ```bash
+if [ ! -e parameter-store.key ]; then
+  umask 077
+  openssl rand -base64 -out parameter-store.key 32
+  chmod 400 parameter-store.key
+  sudo chown 1000:1000 parameter-store.key
+fi
 docker compose up -d --build
 ```
+
+Generate the key once before the first start. The guarded command refuses to
+overwrite an existing key. If the host user already has UID/GID `1000`, the
+`chown` command may not be needed. Do not regenerate the key while an existing
+database is in use: changing or losing it makes the encrypted values
+unrecoverable.
 
 Check the service:
 
@@ -50,7 +65,10 @@ http://192.168.4.153:8080/
 ```
 
 The Compose configuration publishes `0.0.0.0:8080:8080`, so both local and LAN
-access work. Do not expose this service to the public Internet.
+access work. The service has no authentication and responses are sent over
+plain HTTP; do not expose it to the public Internet. For sensitive values, use
+HTTPS and authentication at a trusted reverse proxy or use a purpose-built
+secret manager.
 
 ## Data and permissions
 
@@ -72,6 +90,24 @@ chmod 700 data
 
 If the host user already has UID/GID `1000`, ownership may already be correct.
 
+The encryption key is stored separately at:
+
+```text
+./parameter-store.key
+```
+
+Compose mounts this file read-only at
+`/run/secrets/parameter-store.key`. It contains a base64-encoded random 32-byte
+key. The file is ignored by both Git and the Docker build context; protect it
+with restrictive permissions and back it up separately from the database. The
+application refuses to start if the key is missing or invalid and never creates
+a replacement automatically.
+
+On startup, any legacy plaintext values from an older database are encrypted
+transactionally with the configured key. A failed migration is rolled back.
+Fresh values are stored as authenticated encrypted BLOBs in
+`./data/parameters.db`.
+
 Stop the container without deleting the database:
 
 ```bash
@@ -86,7 +122,9 @@ docker compose logs -f parameter-store
 
 ## REST API
 
-All request bodies are JSON objects. Values must be strings.
+All request bodies are JSON objects. Values must be strings. Values are
+encrypted before they are written to SQLite and decrypted when returned by the
+API.
 
 ### List parameters
 
@@ -149,11 +187,14 @@ A healthy service returns:
 - The remaining name characters may be letters, numbers, `.`, `_`, `:`, or `-`.
 - Values must be strings no larger than 64 KiB when encoded as UTF-8.
 - JSON request bodies are limited to 64 KiB.
-- Invalid JSON, incomplete bodies, malformed request targets, and unavailable storage return controlled error responses.
+- Invalid JSON, incomplete bodies, malformed request targets, unavailable
+  storage, and ciphertext-integrity failures return controlled error responses.
+- Missing or invalid encryption-key files prevent application startup.
 
 ## Development
 
-The application has no third-party Python dependencies. Run the tests with:
+The application declares its encryption dependency in `requirements.txt`. Run
+the tests with:
 
 ```bash
 make test
@@ -183,10 +224,11 @@ make logs            Follow container logs
 
 ## Git safety
 
-Runtime databases, SQLite sidecar files, environment files, and Python cache
-files are ignored by Git. Review staged changes before committing, and never
-commit a populated database or confidential data.
+Runtime databases, SQLite sidecar files, the encryption key, environment files,
+and Python cache files are ignored by Git. The key is also excluded from the
+Docker build context. Review staged changes before committing, and never commit
+a populated database, key file, `.env` file, or confidential data.
 
-This project is intentionally a simple non-secret LAN tool. If authentication,
-encryption, audit logging, or secret storage is required, use a purpose-built
-system instead of this application.
+This project provides encryption at rest, but not authentication, authorization,
+HTTPS, audit logging, or key rotation. Add those controls or use a purpose-built
+secret manager when the threat model requires them.

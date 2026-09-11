@@ -5,6 +5,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# Local encryption key; never commit this file.
+parameter-store.key
+
 # Runtime database and SQLite sidecar files.
 data/*
 !data/.gitkeep

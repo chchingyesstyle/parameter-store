@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Small non-secret parameter/value store for a trusted LAN."""
+"""Small encrypted parameter/value store for a trusted LAN."""
 
 from __future__ import annotations
 
+import base64 as _base64
+import binascii as _binascii
 import json as _json
 import os
 import re
@@ -16,6 +18,9 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 from types import SimpleNamespace
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 
 json = SimpleNamespace(
     dumps=_json.dumps,
@@ -26,6 +31,11 @@ json = SimpleNamespace(
 
 MAX_PARAMETER_LENGTH = 128
 MAX_VALUE_LENGTH = 64 * 1024
+KEY_LENGTH = 32
+NONCE_LENGTH = 12
+GCM_TAG_LENGTH = 16
+ENCRYPTION_VERSION = b"\x01"
+AAD_PREFIX = b"parameter-store:v1:"
 REQUEST_HEADER_READ_TIMEOUT = 1.0
 REQUEST_BODY_READ_TIMEOUT = 1.0
 PARAMETER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -35,22 +45,87 @@ class ParameterError(ValueError):
     """Raised when a parameter name or value is invalid."""
 
 
-class ParameterStore:
-    """SQLite-backed storage for non-secret text parameters."""
+class EncryptionKeyError(ValueError):
+    """Raised when the configured encryption key cannot be used."""
 
-    def __init__(self, database_path: Path | str):
+
+class StorageIntegrityError(RuntimeError):
+    """Raised when an encrypted database value cannot be authenticated."""
+
+
+def load_encryption_key(key_path: Path | str) -> bytes:
+    try:
+        encoded = Path(key_path).read_bytes().strip()
+    except OSError as exc:
+        raise EncryptionKeyError("unable to read encryption key file") from exc
+    try:
+        key = _base64.b64decode(encoded, validate=True)
+    except (_binascii.Error, ValueError) as exc:
+        raise EncryptionKeyError("encryption key must be valid base64") from exc
+    if len(key) != KEY_LENGTH:
+        raise EncryptionKeyError("encryption key must decode to exactly 32 bytes")
+    return key
+
+
+class ValueCipher:
+    """Encrypt and authenticate one parameter value at rest."""
+
+    def __init__(self, key: bytes):
+        if not isinstance(key, bytes) or len(key) != KEY_LENGTH:
+            raise EncryptionKeyError("encryption key must be exactly 32 bytes")
+        self._cipher = AESGCM(key)
+
+    @staticmethod
+    def _associated_data(parameter: str) -> bytes:
+        return AAD_PREFIX + parameter.encode("utf-8")
+
+    def encrypt(self, parameter: str, value: str) -> bytes:
+        nonce = os.urandom(NONCE_LENGTH)
+        ciphertext = self._cipher.encrypt(
+            nonce,
+            value.encode("utf-8"),
+            self._associated_data(parameter),
+        )
+        return ENCRYPTION_VERSION + nonce + ciphertext
+
+    def decrypt(self, parameter: str, payload: bytes) -> str:
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise StorageIntegrityError("encrypted value failed authentication")
+        payload = bytes(payload)
+        minimum_length = len(ENCRYPTION_VERSION) + NONCE_LENGTH + GCM_TAG_LENGTH
+        if len(payload) < minimum_length or payload[:1] != ENCRYPTION_VERSION:
+            raise StorageIntegrityError("encrypted value failed authentication")
+        nonce = payload[1 : 1 + NONCE_LENGTH]
+        ciphertext = payload[1 + NONCE_LENGTH :]
+        try:
+            plaintext = self._cipher.decrypt(
+                nonce,
+                ciphertext,
+                self._associated_data(parameter),
+            )
+            return plaintext.decode("utf-8")
+        except (InvalidTag, UnicodeDecodeError, ValueError) as exc:
+            raise StorageIntegrityError("encrypted value failed authentication") from exc
+
+
+class ParameterStore:
+    """SQLite-backed storage for encrypted text parameters."""
+
+    def __init__(self, database_path: Path | str, encryption_key: bytes):
         self.database_path = Path(database_path)
+        self._cipher = ValueCipher(encryption_key)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as connection, connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS parameters (
                     parameter TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
+                    value BLOB NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._migrate_legacy_values(connection)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=10)
@@ -76,9 +151,29 @@ class ParameterStore:
             raise ParameterError("value is too large; maximum size is 64 KiB")
         return value
 
+    def _migrate_legacy_values(self, connection: sqlite3.Connection) -> None:
+        rows = connection.execute("SELECT parameter, value FROM parameters").fetchall()
+        for row in rows:
+            raw_value = row["value"]
+            if isinstance(raw_value, str):
+                parameter = self._validate_parameter(row["parameter"])
+                value = self._validate_value(raw_value)
+                connection.execute(
+                    "UPDATE parameters SET value = ? WHERE parameter = ?",
+                    (self._cipher.encrypt(parameter, value), parameter),
+                )
+            elif not isinstance(raw_value, (bytes, bytearray, memoryview)):
+                raise StorageIntegrityError("encrypted value failed authentication")
+
+    def _decrypt_value(self, parameter: str, raw_value: Any) -> str:
+        if not isinstance(parameter, str):
+            raise StorageIntegrityError("encrypted value failed authentication")
+        return self._cipher.decrypt(parameter, raw_value)
+
     def put(self, parameter: str, value: str) -> None:
         parameter = self._validate_parameter(parameter)
         value = self._validate_value(value)
+        encrypted_value = self._cipher.encrypt(parameter, value)
         updated_at = datetime.now(timezone.utc).isoformat()
         with closing(self._connect()) as connection, connection:
             connection.execute(
@@ -89,7 +184,7 @@ class ParameterStore:
                     value = excluded.value,
                     updated_at = excluded.updated_at
                 """,
-                (parameter, value, updated_at),
+                (parameter, encrypted_value, updated_at),
             )
 
     def get(self, parameter: str) -> str | None:
@@ -98,7 +193,7 @@ class ParameterStore:
             row = connection.execute(
                 "SELECT value FROM parameters WHERE parameter = ?", (parameter,)
             ).fetchone()
-        return None if row is None else str(row["value"])
+        return None if row is None else self._decrypt_value(parameter, row["value"])
 
     def list(self, query: str = "") -> list[dict[str, str]]:
         if not isinstance(query, str):
@@ -124,7 +219,14 @@ class ParameterStore:
                     ORDER BY parameter COLLATE NOCASE
                     """
                 ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            {
+                "parameter": row["parameter"],
+                "value": self._decrypt_value(row["parameter"], row["value"]),
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
 
     def delete(self, parameter: str) -> bool:
         parameter = self._validate_parameter(parameter)
@@ -221,7 +323,7 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query).get("q", [""])[0]
             try:
                 items = self.store.list(query)
-            except sqlite3.Error:
+            except (sqlite3.Error, StorageIntegrityError):
                 self._send_storage_unavailable()
                 return
             except ParameterError as exc:
@@ -233,7 +335,7 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
             try:
                 parameter = self._parameter_from_path(parsed.path)
                 value = self.store.get(parameter)
-            except sqlite3.Error:
+            except (sqlite3.Error, StorageIntegrityError):
                 self._send_storage_unavailable()
                 return
             except ValueError as exc:
@@ -313,8 +415,12 @@ class ParameterHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, ParameterRequestHandler)
 
 
-def create_server(host: str, port: int, database_path: Path | str) -> ParameterHTTPServer:
-    return ParameterHTTPServer((host, port), ParameterStore(database_path))
+def create_server(
+    host: str, port: int, database_path: Path | str, encryption_key: bytes
+) -> ParameterHTTPServer:
+    return ParameterHTTPServer(
+        (host, port), ParameterStore(database_path, encryption_key)
+    )
 
 
 FRONTEND_HTML = """<!doctype html>
@@ -452,7 +558,11 @@ def run() -> None:
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8080"))
     data_dir = Path(os.environ.get("DATA_DIR", "./data"))
-    server = create_server(host, port, data_dir / "parameters.db")
+    key_path = Path(
+        os.environ.get("PARAMETER_STORE_KEY_FILE", "/run/secrets/parameter-store.key")
+    )
+    encryption_key = load_encryption_key(key_path)
+    server = create_server(host, port, data_dir / "parameters.db", encryption_key)
     print(f"Parameter store listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()

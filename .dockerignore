@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .venv/
 data/
+parameter-store.key
 tests/
 .env
 .env.*

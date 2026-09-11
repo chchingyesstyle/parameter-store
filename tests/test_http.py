@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -13,10 +14,15 @@ from urllib.request import Request, urlopen
 from app import create_server
 
 
+TEST_KEY = b"k" * 32
+
+
 class HttpApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.server = create_server("127.0.0.1", 0, Path(self.tmp.name) / "parameters.db")
+        self.server = create_server(
+            "127.0.0.1", 0, Path(self.tmp.name) / "parameters.db", TEST_KEY
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -230,6 +236,21 @@ class HttpApiTests(unittest.TestCase):
             status, result = self.request_json_allow_error(
                 "/api/parameters", "POST", {"parameter": "x", "value": "y"}
             )
+
+        self.assertEqual(status, 500)
+        self.assertEqual(result, {"error": "storage unavailable"})
+
+    def test_tampered_value_returns_generic_storage_error(self):
+        self.request_json(
+            "/api/parameters", "POST", {"parameter": "token", "value": "secret"}
+        )
+        with closing(sqlite3.connect(Path(self.tmp.name) / "parameters.db")) as connection, connection:
+            connection.execute(
+                "UPDATE parameters SET value = ? WHERE parameter = ?",
+                (b"not-a-valid-ciphertext", "token"),
+            )
+
+        status, result = self.request_json_allow_error("/api/parameters/token")
 
         self.assertEqual(status, 500)
         self.assertEqual(result, {"error": "storage unavailable"})
