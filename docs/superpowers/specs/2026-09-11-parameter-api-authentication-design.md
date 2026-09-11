@@ -23,8 +23,8 @@ local processes and must never be committed.
 - Keep `parameter-store.key` exclusively for SQLite encryption.
 - Mount `parameter-store-api.key` read-only into the container.
 - Preserve unauthenticated Docker health checks at `/healthz`.
-- Keep the browser panel reachable at `/`, with the API key held only in
-  browser memory.
+- Keep the browser panel reachable at `/`, with an unlock screen before any
+  parameter data or editing controls are shown.
 - Return generic authentication failures without revealing which part of the
   credential was wrong.
 - Document setup and authenticated API calls without including a real key.
@@ -82,11 +82,18 @@ Authentication is checked before request-body parsing or database access.
 
 ### Browser panel
 
-Add a password-style API-key field to the page. The browser includes its
-value as a Bearer token on API requests. The key is not written to
-`localStorage`, cookies, or any other persistent browser storage. Users can
-refresh after entering a key; an empty or invalid key displays the normal
-unauthorized error message.
+The page shell remains available at `/`, but initially shows only an unlock
+screen with a password-style API-key field and an Unlock button. The user
+pastes the contents of `parameter-store-api.key` into the field; the filename
+itself is not a credential. The parameter table, add form, search controls,
+and edit/delete controls remain hidden until an API request succeeds.
+
+After a successful request, the browser includes the key as a Bearer token on
+subsequent API requests and reveals the parameter panel. The key is held only
+in JavaScript memory. It is not written to `localStorage`, cookies, URLs, or
+any other persistent browser storage, so a page refresh requires unlocking
+again. An empty or invalid key leaves the panel locked and displays the
+generic unauthorized error.
 
 ### Compatibility and failure behavior
 
@@ -107,8 +114,9 @@ the existing parameter API surface.
 - Test a valid Authorization header preserves list/create/read/update/delete
   behavior.
 - Test `/healthz` and `/` remain available without authentication.
-- Test the browser HTML contains the API-key input and does not use persistent
-  browser storage for it.
+- Test the browser HTML contains the unlock screen and API-key input, keeps
+  parameter controls gated behind authentication, and does not use
+  persistent browser storage for the key.
 - Run the full test suite with warnings treated as errors.
 - Build the Docker image and run a disposable-container smoke test with both
   secret files mounted.
@@ -120,4 +128,3 @@ their own secret configuration and must not be placed in the parameter store
 itself. Back up the API key separately from the database. Losing the API key
 requires an intentional credential rotation; losing the encryption key makes
 the encrypted values unrecoverable.
-
