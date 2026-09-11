@@ -504,6 +504,7 @@ FRONTEND_HTML = """<!doctype html>
     body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
     h1 { margin-bottom: .25rem; }
     .warning { border: 1px solid #d97706; border-radius: .5rem; padding: .75rem; }
+    #unlock-panel { max-width: 32rem; }
     form, .toolbar { display: flex; gap: .5rem; flex-wrap: wrap; margin: 1rem 0; }
     input, button { font: inherit; padding: .55rem; }
     input[name=parameter] { min-width: 14rem; }
@@ -517,25 +518,62 @@ FRONTEND_HTML = """<!doctype html>
 </head>
 <body>
   <h1>Parameter Store</h1>
-  <form id="add-form">
-    <input name="parameter" placeholder="parameter" maxlength="128" required pattern="[A-Za-z0-9][A-Za-z0-9_.:-]*">
-    <input name="value" placeholder="value" maxlength="65536" required>
-    <button type="submit">Save</button>
-  </form>
-  <div class="toolbar">
-    <input id="search" placeholder="Search parameters" autocomplete="off">
-    <button id="refresh" type="button">Refresh</button>
-  </div>
-  <p id="message" role="status"></p>
-  <table>
-    <thead><tr><th>Parameter</th><th>Value</th><th>Updated</th><th>Actions</th></tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
+  <section id="unlock-panel">
+    <h2>Unlock</h2>
+    <form id="unlock-form">
+      <label for="api-key">API key</label>
+      <input id="api-key" type="password" autocomplete="off" required>
+      <button type="submit">Unlock</button>
+    </form>
+    <p id="unlock-message" role="status"></p>
+  </section>
+  <section id="parameter-panel" hidden>
+    <form id="add-form">
+      <input name="parameter" placeholder="parameter" maxlength="128" required pattern="[A-Za-z0-9][A-Za-z0-9_.:-]*">
+      <input name="value" placeholder="value" maxlength="65536" required>
+      <button type="submit">Save</button>
+    </form>
+    <div class="toolbar">
+      <input id="search" placeholder="Search parameters" autocomplete="off">
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+    <p id="message" role="status"></p>
+    <table>
+      <thead><tr><th>Parameter</th><th>Value</th><th>Updated</th><th>Actions</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
 <script>
+const unlockPanel = document.querySelector('#unlock-panel');
+const unlockForm = document.querySelector('#unlock-form');
+const apiKeyInput = document.querySelector('#api-key');
+const unlockMessage = document.querySelector('#unlock-message');
+const parameterPanel = document.querySelector('#parameter-panel');
 const form = document.querySelector('#add-form');
 const search = document.querySelector('#search');
 const rows = document.querySelector('#rows');
 const message = document.querySelector('#message');
+let accessToken = '';
+
+function showUnlockMessage(text, isError = false) {
+  unlockMessage.textContent = text;
+  unlockMessage.style.color = isError ? '#dc2626' : '';
+}
+
+function lockPanel() {
+  accessToken = '';
+  apiKeyInput.value = '';
+  parameterPanel.hidden = true;
+  unlockPanel.hidden = false;
+  showUnlockMessage('Enter API key to unlock');
+  apiKeyInput.focus();
+}
+
+function unlockPanelAfterAuthentication() {
+  unlockPanel.hidden = true;
+  parameterPanel.hidden = false;
+  showUnlockMessage('');
+}
 
 function showMessage(text, isError = false) {
   message.textContent = text;
@@ -543,8 +581,15 @@ function showMessage(text, isError = false) {
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...options});
+  const headers = new Headers(options.headers || {});
+  headers.set('Content-Type', 'application/json');
+  if (accessToken) headers.set('Authorization', 'Bearer ' + accessToken);
+  const response = await fetch(url, {...options, headers});
   const data = await response.json();
+  if (response.status === 401) {
+    lockPanel();
+    throw new Error('unauthorized');
+  }
   if (!response.ok) throw new Error(data.error || 'Request failed');
   return data;
 }
@@ -599,12 +644,28 @@ function render(items) {
 }
 
 async function load() {
-  try {
-    const result = await request('/api/parameters');
-    const query = search.value.toLowerCase();
-    render(result.items.filter(item => item.parameter.toLowerCase().includes(query)));
-  } catch (error) { showMessage(error.message, true); }
+  const result = await request('/api/parameters');
+  const query = search.value.toLowerCase();
+  render(result.items.filter(item => item.parameter.toLowerCase().includes(query)));
 }
+
+unlockForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const candidate = apiKeyInput.value.trim();
+  if (!candidate) {
+    showUnlockMessage('Enter API key', true);
+    return;
+  }
+  accessToken = candidate;
+  try {
+    await load();
+    apiKeyInput.value = '';
+    unlockPanelAfterAuthentication();
+    showMessage('Unlocked');
+  } catch (error) {
+    showUnlockMessage(error.message, true);
+  }
+});
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -614,9 +675,13 @@ form.addEventListener('submit', async (event) => {
     form.reset(); await load(); showMessage('Saved');
   } catch (error) { showMessage(error.message, true); }
 });
-search.addEventListener('input', load);
-document.querySelector('#refresh').addEventListener('click', load);
-load();
+search.addEventListener('input', () => {
+  load().catch(error => showMessage(error.message, true));
+});
+document.querySelector('#refresh').addEventListener('click', () => {
+  load().catch(error => showMessage(error.message, true));
+});
+lockPanel();
 </script>
 </body>
 </html>

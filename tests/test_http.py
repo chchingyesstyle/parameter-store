@@ -222,6 +222,15 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(result, {"error": "unauthorized"})
 
+    def test_web_panel_starts_locked_and_does_not_persist_api_key(self):
+        _, _, body = self.request_text("/")
+        self.assertIn('id="unlock-panel"', body)
+        self.assertIn('id="api-key"', body)
+        self.assertIn('id="parameter-panel"', body)
+        self.assertIn('id="parameter-panel" hidden', body)
+        self.assertNotIn("localStorage", body)
+        self.assertNotIn("sessionStorage", body)
+
     def test_deeply_nested_json_returns_bad_request(self):
         nested = b"[" * 2000 + b"0" + b"]" * 2000
         body = b'{"parameter":"nested","value":' + nested + b"}"
