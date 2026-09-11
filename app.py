@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Small non-secret parameter/value store for a trusted LAN."""
+
+from __future__ import annotations
+
+import json as _json
+import os
+import re
+import socket
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+from types import SimpleNamespace
+
+
+json = SimpleNamespace(
+    dumps=_json.dumps,
+    loads=_json.loads,
+    JSONDecodeError=_json.JSONDecodeError,
+)
+
+
+MAX_PARAMETER_LENGTH = 128
+MAX_VALUE_LENGTH = 64 * 1024
+REQUEST_HEADER_READ_TIMEOUT = 1.0
+REQUEST_BODY_READ_TIMEOUT = 1.0
+PARAMETER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+class ParameterError(ValueError):
+    """Raised when a parameter name or value is invalid."""
+
+
+class ParameterStore:
+    """SQLite-backed storage for non-secret text parameters."""
+
+    def __init__(self, database_path: Path | str):
+        self.database_path = Path(database_path)
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parameters (
+                    parameter TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.database_path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    @staticmethod
+    def _validate_parameter(parameter: str) -> str:
+        if not isinstance(parameter, str):
+            raise ParameterError("parameter must be a string")
+        if not PARAMETER_PATTERN.fullmatch(parameter):
+            raise ParameterError(
+                "parameter must start with a letter or number and contain only "
+                "letters, numbers, '.', '_', ':' or '-'; maximum 128 characters"
+            )
+        return parameter
+
+    @staticmethod
+    def _validate_value(value: str) -> str:
+        if not isinstance(value, str):
+            raise ParameterError("value must be a string")
+        if len(value.encode("utf-8")) > MAX_VALUE_LENGTH:
+            raise ParameterError("value is too large; maximum size is 64 KiB")
+        return value
+
+    def put(self, parameter: str, value: str) -> None:
+        parameter = self._validate_parameter(parameter)
+        value = self._validate_value(value)
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO parameters(parameter, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(parameter) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (parameter, value, updated_at),
+            )
+
+    def get(self, parameter: str) -> str | None:
+        parameter = self._validate_parameter(parameter)
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT value FROM parameters WHERE parameter = ?", (parameter,)
+            ).fetchone()
+        return None if row is None else str(row["value"])
+
+    def list(self, query: str = "") -> list[dict[str, str]]:
+        if not isinstance(query, str):
+            raise ParameterError("query must be a string")
+        query = query[:MAX_PARAMETER_LENGTH]
+        with closing(self._connect()) as connection, connection:
+            if query:
+                escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                rows = connection.execute(
+                    """
+                    SELECT parameter, value, updated_at
+                    FROM parameters
+                    WHERE parameter LIKE ? ESCAPE '\\'
+                    ORDER BY parameter COLLATE NOCASE
+                    """,
+                    (f"%{escaped}%",),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT parameter, value, updated_at
+                    FROM parameters
+                    ORDER BY parameter COLLATE NOCASE
+                    """
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def delete(self, parameter: str) -> bool:
+        parameter = self._validate_parameter(parameter)
+        with closing(self._connect()) as connection, connection:
+            result = connection.execute(
+                "DELETE FROM parameters WHERE parameter = ?", (parameter,)
+            )
+        return result.rowcount == 1
+
+
+class ParameterRequestHandler(BaseHTTPRequestHandler):
+    server_version = "ParameterStore/0.1"
+
+    def setup(self) -> None:
+        super().setup()
+        self.connection.settimeout(REQUEST_HEADER_READ_TIMEOUT)
+
+    def log_message(self, _format: str, *_args: Any) -> None:
+        return
+
+    @property
+    def store(self) -> ParameterStore:
+        return self.server.store  # type: ignore[attr-defined]
+
+    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self) -> None:
+        body = FRONTEND_HTML.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _parse_request_target(self):
+        try:
+            return urlparse(self.path)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return None
+
+    def _send_storage_unavailable(self) -> None:
+        self._send_json(500, {"error": "storage unavailable"})
+
+    def _read_json(self) -> dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "-1"))
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > 65536:
+            raise ValueError("request body is too large")
+        previous_timeout = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(REQUEST_BODY_READ_TIMEOUT)
+            body = self.rfile.read(length)
+        except (socket.timeout, TimeoutError) as exc:
+            raise ValueError("request body read timed out") from exc
+        finally:
+            self.connection.settimeout(previous_timeout)
+        if len(body) != length:
+            raise ValueError("request body is incomplete")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError("request body must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
+
+    @staticmethod
+    def _parameter_from_path(path: str) -> str:
+        parts = path.rstrip("/").split("/")
+        if len(parts) != 4 or parts[:3] != ["", "api", "parameters"]:
+            raise ValueError("invalid parameter path")
+        return unquote(parts[3])
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = self._parse_request_target()
+        if parsed is None:
+            return
+        if parsed.path == "/":
+            self._send_html()
+            return
+        if parsed.path == "/healthz":
+            self._send_json(200, {"status": "ok"})
+            return
+        if parsed.path == "/api/parameters":
+            query = parse_qs(parsed.query).get("q", [""])[0]
+            try:
+                items = self.store.list(query)
+            except sqlite3.Error:
+                self._send_storage_unavailable()
+                return
+            except ParameterError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            self._send_json(200, {"items": items})
+            return
+        if parsed.path.startswith("/api/parameters/"):
+            try:
+                parameter = self._parameter_from_path(parsed.path)
+                value = self.store.get(parameter)
+            except sqlite3.Error:
+                self._send_storage_unavailable()
+                return
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            if value is None:
+                self._send_json(404, {"error": "parameter not found"})
+            else:
+                self._send_json(200, {"parameter": parameter, "value": value})
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = self._parse_request_target()
+        if parsed is None:
+            return
+        if parsed.path != "/api/parameters":
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            payload = self._read_json()
+            self.store.put(payload["parameter"], payload["value"])
+        except sqlite3.Error:
+            self._send_storage_unavailable()
+            return
+        except (KeyError, TypeError, ValueError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(201, {"status": "saved"})
+
+    def do_PUT(self) -> None:  # noqa: N802
+        parsed = self._parse_request_target()
+        if parsed is None:
+            return
+        if not parsed.path.startswith("/api/parameters/"):
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            parameter = self._parameter_from_path(parsed.path)
+            payload = self._read_json()
+            self.store.put(parameter, payload["value"])
+        except sqlite3.Error:
+            self._send_storage_unavailable()
+            return
+        except (KeyError, TypeError, ValueError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(200, {"status": "saved"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = self._parse_request_target()
+        if parsed is None:
+            return
+        if not parsed.path.startswith("/api/parameters/"):
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            parameter = self._parameter_from_path(parsed.path)
+            deleted = self.store.delete(parameter)
+        except sqlite3.Error:
+            self._send_storage_unavailable()
+            return
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        if not deleted:
+            self._send_json(404, {"error": "parameter not found"})
+            return
+        self._send_json(200, {"status": "deleted"})
+
+
+class ParameterHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address: tuple[str, int], store: ParameterStore):
+        self.store = store
+        super().__init__(server_address, ParameterRequestHandler)
+
+
+def create_server(host: str, port: int, database_path: Path | str) -> ParameterHTTPServer:
+    return ParameterHTTPServer((host, port), ParameterStore(database_path))
+
+
+FRONTEND_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Parameter Store</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .25rem; }
+    .warning { border: 1px solid #d97706; border-radius: .5rem; padding: .75rem; }
+    form, .toolbar { display: flex; gap: .5rem; flex-wrap: wrap; margin: 1rem 0; }
+    input, button { font: inherit; padding: .55rem; }
+    input[name=parameter] { min-width: 14rem; }
+    input[name=value] { flex: 1; min-width: 18rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; border-bottom: 1px solid #8885; padding: .55rem; vertical-align: top; }
+    td.value { white-space: pre-wrap; overflow-wrap: anywhere; }
+    button { cursor: pointer; }
+    #message { min-height: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Parameter Store</h1>
+  <p class="warning"><strong>Non-secret tool only.</strong> Do not enter passwords, tokens, API keys, or other confidential data.</p>
+  <form id="add-form">
+    <input name="parameter" placeholder="parameter" maxlength="128" required pattern="[A-Za-z0-9][A-Za-z0-9_.:-]*">
+    <input name="value" placeholder="value" maxlength="65536" required>
+    <button type="submit">Save</button>
+  </form>
+  <div class="toolbar">
+    <input id="search" placeholder="Search parameters" autocomplete="off">
+    <button id="refresh" type="button">Refresh</button>
+  </div>
+  <p id="message" role="status"></p>
+  <table>
+    <thead><tr><th>Parameter</th><th>Value</th><th>Updated</th><th>Actions</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+<script>
+const form = document.querySelector('#add-form');
+const search = document.querySelector('#search');
+const rows = document.querySelector('#rows');
+const message = document.querySelector('#message');
+
+function showMessage(text, isError = false) {
+  message.textContent = text;
+  message.style.color = isError ? '#dc2626' : '';
+}
+
+async function request(url, options = {}) {
+  const response = await fetch(url, {headers: {'Content-Type': 'application/json'}, ...options});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+
+async function copyValue(value) {
+  try {
+    await navigator.clipboard.writeText(value);
+    showMessage('Copied');
+  } catch (_error) {
+    window.prompt('Copy value', value);
+  }
+}
+
+function render(items) {
+  rows.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement('tr');
+    const name = document.createElement('td');
+    name.textContent = item.parameter;
+    const value = document.createElement('td');
+    value.className = 'value';
+    value.textContent = item.value;
+    const updated = document.createElement('td');
+    updated.textContent = item.updated_at;
+    const actions = document.createElement('td');
+    const copy = document.createElement('button');
+    copy.type = 'button'; copy.textContent = 'Copy';
+    copy.onclick = () => copyValue(item.value);
+    const edit = document.createElement('button');
+    edit.type = 'button'; edit.textContent = 'Edit';
+    edit.onclick = async () => {
+      const next = window.prompt('New value for ' + item.parameter, item.value);
+      if (next === null) return;
+      try {
+        await request('/api/parameters/' + encodeURIComponent(item.parameter), {method: 'PUT', body: JSON.stringify({value: next})});
+        await load(); showMessage('Saved');
+      } catch (error) { showMessage(error.message, true); }
+    };
+    const remove = document.createElement('button');
+    remove.type = 'button'; remove.textContent = 'Delete';
+    remove.onclick = async () => {
+      if (!window.confirm('Delete ' + item.parameter + '?')) return;
+      try {
+        await request('/api/parameters/' + encodeURIComponent(item.parameter), {method: 'DELETE'});
+        await load(); showMessage('Deleted');
+      } catch (error) { showMessage(error.message, true); }
+    };
+    actions.append(copy, document.createTextNode(' '), edit, document.createTextNode(' '), remove);
+    row.append(name, value, updated, actions);
+    rows.append(row);
+  }
+}
+
+async function load() {
+  try {
+    const result = await request('/api/parameters');
+    const query = search.value.toLowerCase();
+    render(result.items.filter(item => item.parameter.toLowerCase().includes(query)));
+  } catch (error) { showMessage(error.message, true); }
+}
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const formData = new FormData(form);
+  try {
+    await request('/api/parameters', {method: 'POST', body: JSON.stringify({parameter: formData.get('parameter'), value: formData.get('value')})});
+    form.reset(); await load(); showMessage('Saved');
+  } catch (error) { showMessage(error.message, true); }
+});
+search.addEventListener('input', load);
+document.querySelector('#refresh').addEventListener('click', load);
+load();
+</script>
+</body>
+</html>
+"""
+
+
+def run() -> None:
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8080"))
+    data_dir = Path(os.environ.get("DATA_DIR", "./data"))
+    server = create_server(host, port, data_dir / "parameters.db")
+    print(f"Parameter store listening on http://{host}:{port}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    run()

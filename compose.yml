@@ -1,0 +1,15 @@
+services:
+  parameter-store:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: parameter-store
+    restart: unless-stopped
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      DATA_DIR: "/app/data"
+    ports:
+      - "0.0.0.0:8080:8080"
+    volumes:
+      - ./data:/app/data

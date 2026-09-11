@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+
+# Runtime database and SQLite sidecar files.
+data/*
+!data/.gitkeep
