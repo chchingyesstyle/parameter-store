@@ -8,6 +8,7 @@ import binascii as _binascii
 import json as _json
 import os
 import re
+import secrets as _secrets
 import socket
 import sqlite3
 from contextlib import closing
@@ -269,13 +270,47 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
     def store(self) -> ParameterStore:
         return self.server.store  # type: ignore[attr-defined]
 
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+    @property
+    def api_key(self) -> bytes:
+        return self.server.api_key  # type: ignore[attr-defined]
+
+    def _send_json(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_unauthorized(self) -> None:
+        self._send_json(
+            401,
+            {"error": "unauthorized"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    def _require_api_key(self) -> bool:
+        authorization = self.headers.get("Authorization", "")
+        parts = authorization.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            self._send_unauthorized()
+            return False
+        try:
+            presented = _base64.b64decode(parts[1].encode("ascii"), validate=True)
+        except (UnicodeEncodeError, _binascii.Error, ValueError):
+            self._send_unauthorized()
+            return False
+        if not _secrets.compare_digest(presented, self.api_key):
+            self._send_unauthorized()
+            return False
+        return True
 
     def _send_html(self) -> None:
         body = FRONTEND_HTML.encode("utf-8")
@@ -338,6 +373,8 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         if parsed.path == "/api/parameters":
+            if not self._require_api_key():
+                return
             query = parse_qs(parsed.query).get("q", [""])[0]
             try:
                 items = self.store.list(query)
@@ -350,6 +387,8 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"items": items})
             return
         if parsed.path.startswith("/api/parameters/"):
+            if not self._require_api_key():
+                return
             try:
                 parameter = self._parameter_from_path(parsed.path)
                 value = self.store.get(parameter)
@@ -373,6 +412,8 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
         if parsed.path != "/api/parameters":
             self._send_json(404, {"error": "not found"})
             return
+        if not self._require_api_key():
+            return
         try:
             payload = self._read_json()
             self.store.put(payload["parameter"], payload["value"])
@@ -390,6 +431,8 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
             return
         if not parsed.path.startswith("/api/parameters/"):
             self._send_json(404, {"error": "not found"})
+            return
+        if not self._require_api_key():
             return
         try:
             parameter = self._parameter_from_path(parsed.path)
@@ -410,6 +453,8 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
         if not parsed.path.startswith("/api/parameters/"):
             self._send_json(404, {"error": "not found"})
             return
+        if not self._require_api_key():
+            return
         try:
             parameter = self._parameter_from_path(parsed.path)
             deleted = self.store.delete(parameter)
@@ -428,16 +473,23 @@ class ParameterRequestHandler(BaseHTTPRequestHandler):
 class ParameterHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
-    def __init__(self, server_address: tuple[str, int], store: ParameterStore):
+    def __init__(
+        self, server_address: tuple[str, int], store: ParameterStore, api_key: bytes
+    ):
         self.store = store
+        self.api_key = api_key
         super().__init__(server_address, ParameterRequestHandler)
 
 
 def create_server(
-    host: str, port: int, database_path: Path | str, encryption_key: bytes
+    host: str,
+    port: int,
+    database_path: Path | str,
+    encryption_key: bytes,
+    api_key: bytes,
 ) -> ParameterHTTPServer:
     return ParameterHTTPServer(
-        (host, port), ParameterStore(database_path, encryption_key)
+        (host, port), ParameterStore(database_path, encryption_key), api_key
     )
 
 
@@ -578,8 +630,16 @@ def run() -> None:
     key_path = Path(
         os.environ.get("PARAMETER_STORE_KEY_FILE", "/run/secrets/parameter-store.key")
     )
+    api_key_path = Path(
+        os.environ.get(
+            "PARAMETER_STORE_API_KEY_FILE", "/run/secrets/parameter-store-api.key"
+        )
+    )
     encryption_key = load_encryption_key(key_path)
-    server = create_server(host, port, data_dir / "parameters.db", encryption_key)
+    api_key = load_api_key(api_key_path)
+    server = create_server(
+        host, port, data_dir / "parameters.db", encryption_key, api_key
+    )
     print(f"Parameter store listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()

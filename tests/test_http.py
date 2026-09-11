@@ -1,3 +1,4 @@
+import base64
 import json
 import socket
 import sqlite3
@@ -15,13 +16,21 @@ from app import create_server
 
 
 TEST_KEY = b"k" * 32
+TEST_API_KEY = b"a" * 32
+TEST_API_TOKEN = base64.b64encode(TEST_API_KEY).decode("ascii")
+AUTHORIZATION = f"Bearer {TEST_API_TOKEN}"
+AUTHORIZATION_HEADER = f"Authorization: {AUTHORIZATION}\r\n".encode("ascii")
 
 
 class HttpApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.server = create_server(
-            "127.0.0.1", 0, Path(self.tmp.name) / "parameters.db", TEST_KEY
+            "127.0.0.1",
+            0,
+            Path(self.tmp.name) / "parameters.db",
+            TEST_KEY,
+            TEST_API_KEY,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -33,13 +42,22 @@ class HttpApiTests(unittest.TestCase):
         self.thread.join(timeout=5)
         self.tmp.cleanup()
 
-    def request_json(self, path, method="GET", payload=None):
+    @staticmethod
+    def request_headers(authorization="valid"):
+        headers = {"Content-Type": "application/json"}
+        if authorization == "valid":
+            headers["Authorization"] = AUTHORIZATION
+        elif authorization is not None:
+            headers["Authorization"] = authorization
+        return headers
+
+    def request_json(self, path, method="GET", payload=None, authorization="valid"):
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = Request(
             self.base_url + path,
             data=data,
             method=method,
-            headers={"Content-Type": "application/json"},
+            headers=self.request_headers(authorization),
         )
         with urlopen(request, timeout=5) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
@@ -49,19 +67,41 @@ class HttpApiTests(unittest.TestCase):
         with urlopen(request, timeout=5) as response:
             return response.status, response.headers, response.read().decode("utf-8")
 
-    def request_json_allow_error(self, path, method="GET", payload=None):
+    def request_json_allow_error(
+        self, path, method="GET", payload=None, authorization="valid"
+    ):
         try:
-            return self.request_json(path, method, payload)
+            return self.request_json(path, method, payload, authorization)
         except HTTPError as error:
             body = json.loads(error.read().decode("utf-8"))
             return error.code, body
 
-    def request_raw(self, path, body, method="POST"):
+    def request_json_error(
+        self, path, method="GET", payload=None, authorization=None
+    ):
+        data = None if payload is None else json.dumps(payload).encode("utf-8")
+        request = Request(
+            self.base_url + path,
+            data=data,
+            method=method,
+            headers=self.request_headers(authorization),
+        )
+        try:
+            with urlopen(request, timeout=5) as response:
+                return (
+                    response.status,
+                    json.loads(response.read().decode("utf-8")),
+                    response.headers,
+                )
+        except HTTPError as error:
+            return error.code, json.loads(error.read().decode("utf-8")), error.headers
+
+    def request_raw(self, path, body, method="POST", authorization="valid"):
         request = Request(
             self.base_url + path,
             data=body,
             method=method,
-            headers={"Content-Type": "application/json"},
+            headers=self.request_headers(authorization),
         )
         try:
             with urlopen(request, timeout=5) as response:
@@ -150,15 +190,37 @@ class HttpApiTests(unittest.TestCase):
         _, result = self.request_json("/api/parameters")
         self.assertEqual(result["items"], [])
 
-    def test_root_serves_panel_and_health_endpoint_is_ok(self):
+    def test_root_and_health_remain_public(self):
         status, headers, body = self.request_text("/")
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers.get_content_type())
         self.assertIn("Parameter Store", body)
 
-        status, result = self.request_json("/healthz")
+        status, result = self.request_json("/healthz", authorization=None)
         self.assertEqual(status, 200)
         self.assertEqual(result, {"status": "ok"})
+
+    def test_parameter_api_rejects_missing_and_invalid_credentials(self):
+        for authorization in (None, "Basic not-a-bearer-token", "Bearer not-the-key"):
+            with self.subTest(authorization=authorization):
+                status, result, headers = self.request_json_error(
+                    "/api/parameters", authorization=authorization
+                )
+
+                self.assertEqual(status, 401)
+                self.assertEqual(result, {"error": "unauthorized"})
+                self.assertEqual(headers.get("WWW-Authenticate"), "Bearer")
+
+    def test_parameter_api_authenticates_before_body_parsing(self):
+        status, result = self.request_json_allow_error(
+            "/api/parameters",
+            "POST",
+            {"not": "valid for this test"},
+            authorization=None,
+        )
+
+        self.assertEqual(status, 401)
+        self.assertEqual(result, {"error": "unauthorized"})
 
     def test_deeply_nested_json_returns_bad_request(self):
         nested = b"[" * 2000 + b"0" + b"]" * 2000
@@ -184,10 +246,11 @@ class HttpApiTests(unittest.TestCase):
             client.sendall(
                 b"POST /api/parameters HTTP/1.1\r\n"
                 b"Host: localhost\r\n"
-                b"Content-Type: application/json\r\n"
-                b"Content-Length: 100\r\n"
-                b"Connection: close\r\n\r\n"
-                b"{}"
+                + AUTHORIZATION_HEADER
+                + b"Content-Type: application/json\r\n"
+                + b"Content-Length: 100\r\n"
+                + b"Connection: close\r\n\r\n"
+                + b"{}"
             )
             response = client.recv(4096)
 
@@ -212,7 +275,8 @@ class HttpApiTests(unittest.TestCase):
         wire = (
             b"POST /api/parameters HTTP/1.1\r\n"
             b"Host: localhost\r\n"
-            b"Content-Type: application/json\r\n"
+            + AUTHORIZATION_HEADER
+            + b"Content-Type: application/json\r\n"
             + f"Content-Length: {len(body) + 5}\r\n".encode()
             + b"Connection: close\r\n\r\n"
             + body
