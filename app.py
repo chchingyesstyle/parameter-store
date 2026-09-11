@@ -49,6 +49,10 @@ class EncryptionKeyError(ValueError):
     """Raised when the configured encryption key cannot be used."""
 
 
+class APIKeyError(ValueError):
+    """Raised when the configured API key cannot be used."""
+
+
 class StorageIntegrityError(RuntimeError):
     """Raised when an encrypted database value cannot be authenticated."""
 
@@ -64,6 +68,20 @@ def load_encryption_key(key_path: Path | str) -> bytes:
         raise EncryptionKeyError("encryption key must be valid base64") from exc
     if len(key) != KEY_LENGTH:
         raise EncryptionKeyError("encryption key must decode to exactly 32 bytes")
+    return key
+
+
+def load_api_key(key_path: Path | str) -> bytes:
+    try:
+        encoded = Path(key_path).read_bytes().strip()
+    except OSError as exc:
+        raise APIKeyError("unable to read API key file") from exc
+    try:
+        key = _base64.b64decode(encoded, validate=True)
+    except (_binascii.Error, ValueError) as exc:
+        raise APIKeyError("API key must be valid base64") from exc
+    if len(key) != KEY_LENGTH:
+        raise APIKeyError("API key must decode to exactly 32 bytes")
     return key
 
 

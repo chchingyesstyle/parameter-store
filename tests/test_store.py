@@ -6,12 +6,14 @@ from contextlib import closing
 from pathlib import Path
 
 from app import (
+    APIKeyError,
     EncryptionKeyError,
     ParameterError,
     ParameterStore,
     StorageIntegrityError,
     ValueCipher,
     load_encryption_key,
+    load_api_key,
 )
 
 
@@ -30,6 +32,13 @@ class EncryptionTests(unittest.TestCase):
 
             self.assertEqual(load_encryption_key(path), b"k" * 32)
 
+    def test_loads_exactly_32_decoded_api_key_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "parameter-store-api.key"
+            path.write_bytes(base64.b64encode(b"a" * 32) + b"\n")
+
+            self.assertEqual(load_api_key(path), b"a" * 32)
+
     def test_rejects_missing_or_invalid_key_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing.key"
@@ -40,6 +49,19 @@ class EncryptionTests(unittest.TestCase):
                 load_encryption_key(missing)
             with self.assertRaises(EncryptionKeyError):
                 load_encryption_key(invalid)
+
+    def test_rejects_missing_invalid_and_wrong_length_api_key_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.key"
+            invalid = Path(tmp) / "invalid.key"
+            wrong_length = Path(tmp) / "wrong-length.key"
+            invalid.write_bytes(b"not-base64")
+            wrong_length.write_bytes(base64.b64encode(b"short"))
+
+            for path in (missing, invalid, wrong_length):
+                with self.subTest(path=path.name):
+                    with self.assertRaises(APIKeyError):
+                        load_api_key(path)
 
     def test_encrypts_and_decrypts_with_authenticated_parameter_name(self):
         cipher = ValueCipher(b"k" * 32)
