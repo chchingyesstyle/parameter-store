@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 data/
 parameter-store.key
+parameter-store-api.key
 tests/
 .env
 .env.*
