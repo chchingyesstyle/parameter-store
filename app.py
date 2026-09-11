@@ -447,7 +447,6 @@ FRONTEND_HTML = """<!doctype html>
 </head>
 <body>
   <h1>Parameter Store</h1>
-  <p class="warning"><strong>Non-secret tool only.</strong> Do not enter passwords, tokens, API keys, or other confidential data.</p>
   <form id="add-form">
     <input name="parameter" placeholder="parameter" maxlength="128" required pattern="[A-Za-z0-9][A-Za-z0-9_.:-]*">
     <input name="value" placeholder="value" maxlength="65536" required>
