@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: parameter-store
+    network_mode: bridge
     restart: unless-stopped
     environment:
       HOST: "0.0.0.0"
@@ -12,7 +13,7 @@ services:
       PARAMETER_STORE_KEY_FILE: "/run/secrets/parameter-store.key"
       PARAMETER_STORE_API_KEY_FILE: "/run/secrets/parameter-store-api.key"
     ports:
-      - "0.0.0.0:8080:8080"
+      - "0.0.0.0:${HOST_PORT:-8080}:8080"
     volumes:
       - ./data:/app/data
       - ./parameter-store.key:/run/secrets/parameter-store.key:ro

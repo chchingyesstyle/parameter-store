@@ -48,6 +48,15 @@ while an existing database is in use: changing or losing it makes the
 encrypted values unrecoverable. The API key can be rotated separately, but
 clients and the web panel must then use the new file contents.
 
+The published host port defaults to `8080`. To use a different port for a
+specific environment, create an untracked `.env` file before starting:
+
+```dotenv
+HOST_PORT=4000
+```
+
+If `.env` is omitted, Docker Compose uses port `8080`.
+
 Check the service:
 
 ```bash
@@ -61,8 +70,8 @@ Open the web panel locally:
 http://localhost:8080/
 ```
 
-The Compose configuration publishes `0.0.0.0:8080:8080`, so local and LAN
-connections are technically possible. The intended deployment for this
+The Compose configuration publishes `0.0.0.0:${HOST_PORT:-8080}:8080`, so local
+and LAN connections are technically possible. The intended deployment for this
 configuration keeps callers on the Pi; the API key is a bearer credential and
 the current service does not provide transport encryption.
 
