@@ -5,16 +5,20 @@ the Pi, with values encrypted at rest in SQLite.
 
 > **Security boundary.** Values are encrypted at rest with a key stored outside
 > the database and Docker image. Parameter API requests require a separate API
-> key. This deployment assumes callers run on the Pi and uses plain HTTP; do
-> not expose the published port beyond that trusted scope.
+> key, while the Web panel uses a configurable username/password session. This
+> deployment assumes callers run on the Pi and uses plain HTTP; do not expose
+> the published port beyond that trusted scope.
 
 ## Features
 
 - Browser panel at `/` for listing, searching, saving, editing, copying, and deleting values
+- Dense table view with multi-value Tags and a single Env field
+- Web panel username/password login configured through `.env` (default `admin` / `Abc12345`)
 - REST API for parameter/value CRUD operations
 - SQLite persistence on the host with AES-GCM-encrypted value blobs
 - External, read-only encryption key file mounted into the container
 - Separate, external, read-only API key required for REST API access
+- Existing REST API request/response contracts remain unchanged
 - Parameter-name validation and value-size limits
 - Safe browser rendering using DOM text nodes rather than injected HTML
 - Python `cryptography` dependency for authenticated encryption
@@ -45,9 +49,21 @@ Generate both keys once before the first start. The guarded commands refuse to
 overwrite existing keys. If the host user already has UID/GID `1000`, the
 `chown` command may not be needed. Do not regenerate `parameter-store.key`
 while an existing database is in use: changing or losing it makes the
-encrypted values unrecoverable. The API key can be rotated separately, but
-clients and the web panel must then use the new file contents.
+encrypted values unrecoverable. The API key can be rotated separately, but clients must then use the new file
+contents. The Web panel uses its own session login and does not expose or
+require the API key in the browser.
 
+The Web panel credentials are configured through the ignored `.env` file:
+
+```dotenv
+WEB_USERNAME=admin
+WEB_PASSWORD=Abc12345
+```
+
+Compose defaults to these values when the variables are omitted. Change them
+before exposing the panel beyond a trusted local environment. Web sessions are
+held in memory, use an HttpOnly cookie, and expire after eight hours; refreshing
+or locking the page requires logging in again.
 The published host port defaults to `8080`. To use a different port for a
 specific environment, create an untracked `.env` file before starting:
 
@@ -117,15 +133,16 @@ The API bearer key is stored separately at:
 Compose mounts it read-only at
 `/run/secrets/parameter-store-api.key`. It contains a base64-encoded random
 32-byte API key. Applications send the file contents in the
-`Authorization: Bearer ...` header, and the web panel asks for the same
-contents on its unlock screen. Never give applications or browser users the
-encryption key, and never store either key in SQLite, Git, or the Docker
-image. Both files must be backed up separately from the database.
+`Authorization: Bearer ...` header. The web panel uses the configured
+`WEB_USERNAME` and `WEB_PASSWORD` credentials instead. Never give applications
+or browser users the encryption key, and never store either key in SQLite, Git,
+or the Docker image. Both files must be backed up separately from the database.
 
 On startup, any legacy plaintext values from an older database are encrypted
-transactionally with the configured key. A failed migration is rolled back.
-Fresh values are stored as authenticated encrypted BLOBs in
-`./data/parameters.db`.
+transactionally with the configured key. Existing databases also receive empty
+`tags` and `env` metadata columns without losing values or timestamps. A failed
+migration is rolled back. Fresh values are stored as authenticated encrypted
+BLOBs in `./data/parameters.db`.
 
 Stop the container without deleting the database:
 
@@ -150,10 +167,14 @@ into a shell variable without printing it:
 API_KEY="$(tr -d '\n' < parameter-store-api.key)"
 ```
 
-The browser panel uses the same key: open `/`, paste the contents of
-`parameter-store-api.key` into the unlock box, and click **Unlock**. The
-parameter table and edit controls remain hidden until the authenticated list
-request succeeds. Refreshing the page requires unlocking again.
+The browser panel opens at `/` and uses the configured Web username/password.
+After login, the table supports searching across parameter names, Tags, and
+Env, plus separate Tag and Env filters. Tags are entered as comma-separated
+values; Env is one value. The Edit action opens one form for the parameter name,
+value, Tags, and Env. Renaming is rejected when the new parameter name already
+exists, so an edit never overwrites another parameter. The existing REST API
+payloads remain unchanged, so REST clients continue to use the API bearer key
+and do not receive metadata fields.
 
 ### List parameters
 
@@ -221,7 +242,7 @@ A healthy service returns:
 - Names must start with a letter or number.
 - The remaining name characters may be letters, numbers, `.`, `_`, `:`, or `-`.
 - Values must be strings no larger than 64 KiB when encoded as UTF-8.
-- JSON request bodies are limited to 64 KiB.
+- JSON request bodies are limited to 64 KiB and 64 levels of nesting.
 - Invalid JSON, incomplete bodies, malformed request targets, unavailable
   storage, and ciphertext-integrity failures return controlled error responses.
 - Missing or invalid encryption-key or API-key files prevent application
